@@ -1,60 +1,37 @@
 /**
  ******************************************************************************
  * @file    main.c
- * @brief   EduScope-10 bare-metal oscilloscope and function generator
- * @author  Musaab Taha
+ * @author  Musaab Taha - mosab_taha@hotmail.com
+ * @brief   EduScope-10 bare-metal function generator and oscilloscope prototype
  ******************************************************************************
- * Prototype platform: STM32F429I-DISC1
  *
- * Function generator:
- *   PA4  - DAC1 output
- *   PA1  - amplitude potentiometer, ADC1 channel 1
- *   PA2  - frequency potentiometer, ADC1 channel 2
- *   PB1  - output enable/disable button
- *   PB2  - waveform selection button
+ * Hardware prototype: STM32F429I-DISC1
  *
- * Oscilloscope:
- *   PA3  - ADC2 channel 3 input
- *   TIM8 - ADC2 sampling clock
+ * Function generator
+ *   PA4  -> DAC channel 1 output
+ *   PA1  -> ADC1 channel 1, amplitude potentiometer
+ *   PA2  -> ADC1 channel 2, frequency potentiometer
+ *   PB1  -> Function-generator output button
+ *   PB2  -> Waveform-selection button
  *
- * The application uses direct register access. STM32Cube supplies only the
- * startup files and linker script through PlatformIO.
+ * Oscilloscope
+ *   PA3  -> ADC2 channel 3 input
+ *   TIM8 -> ADC2 sampling timer
+ *
+ * The firmware uses direct register access without HAL or CubeMX-generated
+ * peripheral code. ADC2_Val_temp and ADC2_Val can be observed with STM32 Viewer.
  ******************************************************************************
  */
 
-#include <stdbool.h>
-#include <stdint.h>
 #include <math.h>
+#include <stdint.h>
+
+#if !defined(__SOFT_FP__) && defined(__ARM_FP)
+#warning "FPU is not initialized, but the project is compiling for an FPU."
+#endif
 
 /* ========================================================================== */
-/* Configuration                                                              */
-/* ========================================================================== */
-
-#define SYSTEM_CLOCK_HZ                 16000000U
-#define TIMER_AUTO_RELOAD                     49U
-#define WAVE_LUT_SIZE                        128U
-#define SCOPE_SAMPLE_RATE_HZ                5000U
-
-#define DEFAULT_FREQUENCY_HZ              1000.0f
-#define MIN_FREQUENCY_HZ                     0.1f
-#define MAX_FREQUENCY_HZ                  2500.0f
-
-#define DEFAULT_AMPLITUDE_V                   0.5f
-#define MAX_AMPLITUDE_V                       1.65f
-
-#define DAC_CENTER_CODE                      2048U
-#define DAC_MAX_CODE                         4095U
-
-/* Prototype calibration values retained from the validated firmware */
-#define AMPLITUDE_POT_FULL_SCALE           3822.0f
-#define FREQUENCY_POT_FULL_SCALE           3799.0f
-#define SCOPE_CALIBRATED_VREF                  3.0f
-#define SCOPE_CALIBRATED_COUNTS             3722.0f
-
-#define TWO_PI                    6.28318530717958647692f
-
-/* ========================================================================== */
-/* Register maps                                                              */
+/* Register type definitions                                                  */
 /* ========================================================================== */
 
 typedef struct
@@ -68,7 +45,7 @@ typedef struct
     volatile uint32_t BSRR;
     volatile uint32_t LCKR;
     volatile uint32_t AFR[2];
-} GPIO_Registers;
+} GPIO_t;
 
 typedef struct
 {
@@ -86,7 +63,7 @@ typedef struct
     volatile uint32_t DOR1;
     volatile uint32_t DOR2;
     volatile uint32_t SR;
-} DAC_Registers;
+} DAC_t;
 
 typedef struct
 {
@@ -122,7 +99,7 @@ typedef struct
     volatile uint32_t PLLI2SCFGR;
     volatile uint32_t PLLSAICFGR;
     volatile uint32_t DCKCFGR;
-} RCC_Registers;
+} RCC_t;
 
 typedef struct
 {
@@ -146,7 +123,7 @@ typedef struct
     volatile uint32_t BDTR;
     volatile uint32_t DCR;
     volatile uint32_t DMAR;
-} TIM_Registers;
+} TIM_t;
 
 typedef struct
 {
@@ -163,7 +140,7 @@ typedef struct
     volatile uint8_t IPR[240];
     uint32_t RESERVED5[644];
     volatile uint32_t STIR;
-} NVIC_Registers;
+} NVIC_t;
 
 typedef struct
 {
@@ -187,487 +164,331 @@ typedef struct
     volatile uint32_t JDR3;
     volatile uint32_t JDR4;
     volatile uint32_t DR;
-} ADC_Registers;
+} ADC_t;
 
-#define RCC_BASE_ADDRESS      0x40023800U
-#define GPIOA_BASE_ADDRESS    0x40020000U
-#define GPIOB_BASE_ADDRESS    0x40020400U
-#define DAC_BASE_ADDRESS      0x40007400U
-#define TIM1_BASE_ADDRESS     0x40010000U
-#define TIM8_BASE_ADDRESS     0x40010400U
-#define ADC1_BASE_ADDRESS     0x40012000U
-#define ADC2_BASE_ADDRESS     0x40012100U
-#define NVIC_BASE_ADDRESS     0xE000E100U
-#define CPACR_ADDRESS         0xE000ED88U
-
-#define RCC     ((RCC_Registers *)RCC_BASE_ADDRESS)
-#define GPIOA   ((GPIO_Registers *)GPIOA_BASE_ADDRESS)
-#define GPIOB   ((GPIO_Registers *)GPIOB_BASE_ADDRESS)
-#define DAC1    ((DAC_Registers *)DAC_BASE_ADDRESS)
-#define TIM1    ((TIM_Registers *)TIM1_BASE_ADDRESS)
-#define TIM8    ((TIM_Registers *)TIM8_BASE_ADDRESS)
-#define ADC1    ((ADC_Registers *)ADC1_BASE_ADDRESS)
-#define ADC2    ((ADC_Registers *)ADC2_BASE_ADDRESS)
-#define NVIC    ((NVIC_Registers *)NVIC_BASE_ADDRESS)
-
-/* ========================================================================== */
-/* Register bits                                                              */
-/* ========================================================================== */
-
-#define TIM_CR1_CEN               (1U << 0)
-#define TIM_CR1_URS               (1U << 2)
-#define TIM_DIER_UIE              (1U << 0)
-#define TIM_SR_UIF                (1U << 0)
-#define TIM_EGR_UG                (1U << 0)
-
-#define ADC_SR_EOC                (1U << 1)
-#define ADC_CR1_EOCIE             (1U << 5)
-#define ADC_CR1_SCAN              (1U << 8)
-#define ADC_CR2_ADON              (1U << 0)
-#define ADC_CR2_CONT              (1U << 1)
-#define ADC_CR2_EOCS              (1U << 10)
-#define ADC_CR2_SWSTART           (1U << 30)
-
-#define ADC_IRQ_NUMBER                   18U
-#define TIM1_UP_TIM10_IRQ_NUMBER         25U
-#define TIM8_UP_TIM13_IRQ_NUMBER         44U
-
-/* ========================================================================== */
-/* Application state                                                          */
-/* ========================================================================== */
-
-typedef enum
+typedef struct
 {
-    WAVEFORM_SINE = 0,
-    WAVEFORM_SQUARE,
-    WAVEFORM_TRIANGLE,
-    WAVEFORM_SAWTOOTH,
-    WAVEFORM_COUNT
-} Waveform;
+    volatile uint32_t IDCODE;
+    volatile uint32_t CR;
+    volatile uint32_t APB1;
+    volatile uint32_t APB2;
+} DBG_t;
 
-static uint16_t s_wave_lut[WAVE_LUT_SIZE];
-static volatile uint16_t s_lut_index = 0U;
-static volatile bool s_output_enabled = true;
-static bool s_awg_timer_initialized = false;
+enum wave_type
+{
+    sine,
+    square,
+    triangle,
+    sawtooth
+};
 
-static Waveform s_waveform = WAVEFORM_SINE;
-static float s_amplitude_v = DEFAULT_AMPLITUDE_V;
-static float s_frequency_hz = DEFAULT_FREQUENCY_HZ;
+/* ========================================================================== */
+/* Peripheral addresses                                                       */
+/* ========================================================================== */
 
-static bool s_previous_output_button = false;
-static bool s_previous_wave_button = false;
+#define RCC_BASE     0x40023800U
+#define GPIOA_BASE   0x40020000U
+#define GPIOB_BASE   0x40020400U
+#define DAC_BASE     0x40007400U
+#define CPACR        0xE000ED88U
+#define TIM1_BASE    0x40010000U
+#define TIM8_BASE    0x40010400U
+#define NVIC_BASE    0xE000E100U
+#define ADC1_BASE    0x40012000U
+#define ADC2_BASE    0x40012100U
+#define DBG_BASE     0xE0042000U
+#define DEMCR_BASE   0xE000EDFCU
 
-/* Watch these two variables in STM32 Viewer */
-volatile uint16_t g_scope_adc_raw = 0U;
-volatile float g_scope_voltage_v = 0.0f;
+#define RCC          ((RCC_t *)RCC_BASE)
+#define GPIOA        ((GPIO_t *)GPIOA_BASE)
+#define GPIOB        ((GPIO_t *)GPIOB_BASE)
+#define DAC           ((DAC_t *)DAC_BASE)
+#define TIM1          ((TIM_t *)TIM1_BASE)
+#define TIM8          ((TIM_t *)TIM8_BASE)
+#define NVIC          ((NVIC_t *)NVIC_BASE)
+#define ADC1          ((ADC_t *)ADC1_BASE)
+#define ADC2          ((ADC_t *)ADC2_BASE)
+#define DBG           ((DBG_t *)DBG_BASE)
+
+/* ========================================================================== */
+/* Application constants and state                                            */
+/* ========================================================================== */
+
+#define NS          128U
+#define TWO_PI      6.28318530717958647692f
+#define ARR_Val     49U
+#define MCU_CLK     16000000U
+#define center      2048U
+
+uint16_t Wave_LUT[NS];
+
+volatile uint8_t flg = 0U;
+volatile uint16_t pot1 = 0U;
+volatile uint16_t pot2 = 0U;
+volatile uint16_t ADC2_Val_temp = 0U;
+volatile float ADC2_Val = 0.0f;
+
+uint8_t lut_index = 0U;
+uint32_t psc = 0U;
+float desired_Amplitude = 0.5f;
+float frequency = 1.0f;
+enum wave_type desired_wave = sine;
 
 /* ========================================================================== */
 /* Function declarations                                                      */
 /* ========================================================================== */
 
-static void FPU_Init(void);
-static void GPIO_Init(void);
-static void DAC_Init(void);
-static void ADC_Init(void);
-static void NVIC_Init(void);
+void GPIO_Init(void);
+void DAC_Init(void);
+void TIMx_Init(int freq);
+void NVIC_Init(void);
+void ADC_Init(void);
+void DBG_Init(void);
+float Amplitude_calc(float desired_amplitude);
+void WaveLUT_Generate(enum wave_type wave);
 
-static uint16_t Timer_CalculatePrescaler(float event_rate_hz);
-static void Timer_Configure(TIM_Registers *timer, uint16_t prescaler);
-static void AWG_TimerInit(float output_frequency_hz);
-static void AWG_TimerSetFrequency(float output_frequency_hz);
-static void Scope_TimerInit(uint32_t sample_rate_hz);
+/* ========================================================================== */
+/* Main                                                                       */
+/* ========================================================================== */
 
-static uint16_t ADC1_ReadNextConversion(void);
-static void ADC1_ReadControls(uint16_t *amplitude_raw, uint16_t *frequency_raw);
+int main(void)
+{
+    /* Enable CP10 and CP11 for the Cortex-M4 floating-point unit */
+    *(volatile uint32_t *)CPACR |= (3U << 20);
+    *(volatile uint32_t *)CPACR |= (3U << 22);
 
-static uint16_t AWG_ClampDacCode(float value);
-static float AWG_AmplitudeToCounts(float amplitude_v);
-static void AWG_GenerateLut(void);
-static void AWG_Init(void);
-static void AWG_SetAmplitude(float amplitude_v);
-static void AWG_SetFrequency(float frequency_hz);
-static void AWG_SelectNextWaveform(void);
-static void AWG_ToggleOutput(void);
+    GPIO_Init();
+    DAC_Init();
+    NVIC_Init();
+    ADC_Init();
+    DBG_Init();
 
-static void Scope_Init(void);
-static void Controls_Process(void);
+    /* TIM8 uses this value as the ADC2 oscilloscope sampling frequency */
+    TIMx_Init(5000);
+
+    while (1)
+    {
+        /* Start one ADC1 scan sequence for the two potentiometers */
+        for (volatile int i = 0; i < 1000; i++)
+        {
+            /* Short delay retained from the working prototype */
+        }
+        ADC1->CR2 |= (1U << 30);
+
+        /* PB1: preserve the original DAC trigger-enable toggle behavior */
+        if ((GPIOB->IDR >> 1) & 1U)
+        {
+            DAC->CR ^= (1U << 2);
+            for (volatile int i = 0; i < 100000; i++)
+            {
+                /* Simple button debounce delay */
+            }
+        }
+
+        /* PB2: select the next waveform */
+        if ((GPIOB->IDR >> 2) & 1U)
+        {
+            desired_wave++;
+
+            for (volatile int i = 0; i < 100000; i++)
+            {
+                /* Simple button debounce delay */
+            }
+        }
+
+        /* Convert the two potentiometer readings into amplitude and frequency */
+        desired_Amplitude = (pot1 * 1.65f) / 3822.0f;
+        frequency = (pot2 * 2500.0f) / 3799.0f;
+
+        /* TIM1 update frequency = waveform frequency x LUT sample count */
+        psc = (uint32_t)((MCU_CLK / ((frequency * NS) * (ARR_Val + 1U))) - 1.0f);
+
+        TIM1->ARR = ARR_Val;
+        TIM1->PSC = psc;
+
+        /* Rebuild the LUT when amplitude or waveform selection changes */
+        WaveLUT_Generate(desired_wave);
+    }
+}
 
 /* ========================================================================== */
 /* Peripheral initialization                                                  */
 /* ========================================================================== */
 
-static void FPU_Init(void)
-{
-    volatile uint32_t *const cpacr = (volatile uint32_t *)CPACR_ADDRESS;
-    *cpacr |= (3U << 20) | (3U << 22);
-}
-
-static void GPIO_Init(void)
+void GPIO_Init(void)
 {
     RCC->AHB1ENR |= (1U << 0); /* GPIOA clock */
+
+    GPIOA->MODER |= (3U << 8); /* PA4: DAC output, analog mode */
+    GPIOA->MODER |= (3U << 2); /* PA1: ADC1 channel 1, amplitude pot */
+    GPIOA->MODER |= (3U << 4); /* PA2: ADC1 channel 2, frequency pot */
+    GPIOA->MODER |= (3U << 6); /* PA3: ADC2 channel 3, scope input */
+
     RCC->AHB1ENR |= (1U << 1); /* GPIOB clock */
 
-    /* PA1: amplitude pot, PA2: frequency pot, PA3: scope input, PA4: DAC */
-    GPIOA->MODER &= ~((3U << 2) | (3U << 4) | (3U << 6) | (3U << 8));
-    GPIOA->MODER |=  ((3U << 2) | (3U << 4) | (3U << 6) | (3U << 8));
-    GPIOA->PUPDR &= ~((3U << 2) | (3U << 4) | (3U << 6) | (3U << 8));
+    GPIOB->MODER &= ~(3U << 2); /* PB1 input */
+    GPIOB->MODER &= ~(3U << 4); /* PB2 input */
 
-    /* PB1 and PB2: buttons connected to 3.3 V, internal pull-down enabled */
-    GPIOB->MODER &= ~((3U << 2) | (3U << 4));
-    GPIOB->PUPDR &= ~((3U << 2) | (3U << 4));
-    GPIOB->PUPDR |=  ((2U << 2) | (2U << 4));
+    GPIOB->PUPDR &= ~(3U << 2);
+    GPIOB->PUPDR |=  (2U << 2); /* PB1 pull-down */
+
+    GPIOB->PUPDR &= ~(3U << 4);
+    GPIOB->PUPDR |=  (2U << 4); /* PB2 pull-down */
 }
 
-static void DAC_Init(void)
+void DAC_Init(void)
 {
-    RCC->APB1ENR |= (1U << 29);
+    RCC->APB1ENR |= (1U << 29); /* DAC clock */
 
-    DAC1->CR |=  (1U << 0); /* DAC channel 1 enable */
-    DAC1->CR &= ~(1U << 1); /* Output buffer enable */
-    DAC1->DHR12R1 = DAC_CENTER_CODE;
+    DAC->CR |=  (1U << 0);      /* Enable DAC channel 1 */
+    DAC->CR &= ~(1U << 1);      /* Enable the DAC output buffer */
 }
 
-static void ADC_Init(void)
+void TIMx_Init(int freq)
+{
+    /* TIM1 drives the DAC waveform sample updates */
+    RCC->APB2ENR |= (1U << 0);
+
+    TIM1->ARR = ARR_Val;
+    TIM1->PSC = psc;
+    TIM1->EGR |= (1U << 0);
+    TIM1->SR &= ~(1U << 0);
+    TIM1->CR1 &= ~(1U << 1);
+    TIM1->CR1 |= (1U << 2);
+    TIM1->CR1 &= ~(1U << 4);
+    TIM1->DIER |= (1U << 0);
+    TIM1->CR1 |= (1U << 0);
+
+    /* TIM8 triggers one ADC2 conversion at the requested sample frequency */
+    psc = (MCU_CLK / ((uint32_t)freq * (ARR_Val + 1U))) - 1U;
+
+    RCC->APB2ENR |= (1U << 1);
+
+    TIM8->ARR = ARR_Val;
+    TIM8->PSC = psc;
+    TIM8->EGR |= (1U << 0);
+    TIM8->SR &= ~(1U << 0);
+    TIM8->CR1 &= ~(1U << 1);
+    TIM8->CR1 |= (1U << 2);
+    TIM8->CR1 &= ~(1U << 4);
+    TIM8->DIER |= (1U << 0);
+    TIM8->CR1 |= (1U << 0);
+}
+
+void NVIC_Init(void)
+{
+    NVIC->ISER[0] |= (1U << 25); /* TIM1_UP_TIM10 IRQ */
+    NVIC->ISER[0] |= (1U << 18); /* Shared ADC IRQ */
+    NVIC->ISER[1] |= (1U << 12); /* TIM8_UP_TIM13 IRQ */
+
+    NVIC->IPR[25] = 0x10;
+    NVIC->IPR[18] = 0x00;
+}
+
+void ADC_Init(void)
 {
     RCC->APB2ENR |= (1U << 8); /* ADC1 clock */
     RCC->APB2ENR |= (1U << 9); /* ADC2 clock */
 
-    /* ADC1 regular sequence: channel 1, then channel 2 */
-    ADC1->SQR3 &= ~((0x1FU << 0) | (0x1FU << 5));
-    ADC1->SQR3 |=  ((1U << 0) | (2U << 5));
-    ADC1->SQR1 &= ~(0xFU << 20);
-    ADC1->SQR1 |=  (1U << 20); /* Two conversions */
+    /* ADC1 scan sequence: channel 1 followed by channel 2 */
+    ADC1->SQR3 |= (1U << 0);
+    ADC1->SQR3 |= (2U << 5);
+    ADC1->SQR1 |= (1U << 20);  /* Two regular conversions */
 
-    ADC1->CR1 |= ADC_CR1_SCAN;
-    ADC1->CR1 &= ~ADC_CR1_EOCIE;
-    ADC1->CR2 &= ~ADC_CR2_CONT;
-    ADC1->CR2 |= ADC_CR2_EOCS;
-    ADC1->CR2 |= ADC_CR2_ADON;
+    ADC1->CR2 |= (1U << 0);    /* Enable ADC1 */
+    ADC1->CR1 |= (1U << 5);    /* EOC interrupt */
+    ADC1->CR1 |= (1U << 8);    /* Scan mode */
+    ADC1->CR2 &= ~(1U << 1);   /* Single scan sequence per software start */
+    ADC1->CR2 |= (1U << 10);   /* EOC after every conversion */
 
-    /* ADC2 regular sequence: channel 3 */
-    ADC2->SQR1 &= ~(0xFU << 20);
-    ADC2->SQR3 &= ~(0x1FU << 0);
-    ADC2->SQR3 |=  (3U << 0);
+    /* ADC2 regular sequence: channel 3 only */
+    ADC2->SQR3 |= (3U << 0);
 
-    ADC2->CR1 |= ADC_CR1_EOCIE;
-    ADC2->CR2 &= ~ADC_CR2_CONT;
-    ADC2->CR2 |= ADC_CR2_EOCS;
-    ADC2->CR2 |= ADC_CR2_ADON;
+    ADC2->CR2 |= (1U << 0);    /* Enable ADC2 */
+    ADC2->CR1 |= (1U << 5);    /* EOC interrupt */
+    ADC2->CR2 &= ~(1U << 1);   /* Single conversion mode */
+    ADC2->CR2 |= (1U << 10);   /* EOC after conversion */
 }
 
-static void NVIC_Init(void)
+void DBG_Init(void)
 {
-    NVIC->ISER[0] |= (1U << ADC_IRQ_NUMBER);
-    NVIC->ISER[0] |= (1U << TIM1_UP_TIM10_IRQ_NUMBER);
-    NVIC->ISER[1] |= (1U << (TIM8_UP_TIM13_IRQ_NUMBER - 32U));
-
-    NVIC->IPR[ADC_IRQ_NUMBER] = 0x00U;
-    NVIC->IPR[TIM1_UP_TIM10_IRQ_NUMBER] = 0x10U;
-    NVIC->IPR[TIM8_UP_TIM13_IRQ_NUMBER] = 0x20U;
+    *(volatile uint32_t *)DEMCR_BASE |= (1U << 24); /* Trace enable */
+    DBG->CR |= (1U << 5);                         /* Trace I/O enable */
 }
 
 /* ========================================================================== */
-/* Timer control                                                              */
+/* Function-generator waveform generation                                     */
 /* ========================================================================== */
 
-static uint16_t Timer_CalculatePrescaler(float event_rate_hz)
+float Amplitude_calc(float desired_amplitude)
 {
-    float divider;
-    uint32_t prescaler;
-
-    if (event_rate_hz <= 0.0f)
-    {
-        return 0xFFFFU;
-    }
-
-    divider = (float)SYSTEM_CLOCK_HZ /
-              (event_rate_hz * (float)(TIMER_AUTO_RELOAD + 1U));
-
-    if (divider <= 1.0f)
-    {
-        return 0U;
-    }
-
-    prescaler = (uint32_t)(divider - 1.0f + 0.5f);
-
-    if (prescaler > 0xFFFFU)
-    {
-        prescaler = 0xFFFFU;
-    }
-
-    return (uint16_t)prescaler;
+    return (2047.5f * desired_amplitude) / 1.65f;
 }
 
-static void Timer_Configure(TIM_Registers *timer, uint16_t prescaler)
+void WaveLUT_Generate(enum wave_type wave)
 {
-    timer->CR1 = 0U;
-    timer->DIER = 0U;
-    timer->PSC = prescaler;
-    timer->ARR = TIMER_AUTO_RELOAD;
-    timer->EGR = TIM_EGR_UG;
-    timer->SR = 0U;
-    timer->CR1 = TIM_CR1_URS;
-    timer->DIER = TIM_DIER_UIE;
-    timer->CR1 |= TIM_CR1_CEN;
-}
+    float cnt = center;
+    float amp = Amplitude_calc(desired_Amplitude);
+    float max = center + amp;
+    float min = center - amp;
+    float step = (max - center) / (NS / 4U);
 
-static void AWG_TimerInit(float output_frequency_hz)
-{
-    RCC->APB2ENR |= (1U << 0); /* TIM1 clock */
+    float step_sawtooth = (max - min) / NS;
+    float cnt_sawtooth = min;
 
-    Timer_Configure(
-        TIM1,
-        Timer_CalculatePrescaler(output_frequency_hz * (float)WAVE_LUT_SIZE));
-
-    s_awg_timer_initialized = true;
-}
-
-static void AWG_TimerSetFrequency(float output_frequency_hz)
-{
-    uint16_t new_prescaler = Timer_CalculatePrescaler(
-        output_frequency_hz * (float)WAVE_LUT_SIZE);
-
-    if (TIM1->PSC != new_prescaler)
+    switch (wave)
     {
-        TIM1->PSC = new_prescaler;
-        TIM1->EGR = TIM_EGR_UG;
-        TIM1->SR &= ~TIM_SR_UIF;
-    }
-}
-
-static void Scope_TimerInit(uint32_t sample_rate_hz)
-{
-    RCC->APB2ENR |= (1U << 1); /* TIM8 clock */
-    Timer_Configure(TIM8, Timer_CalculatePrescaler((float)sample_rate_hz));
-}
-
-/* ========================================================================== */
-/* ADC control inputs                                                         */
-/* ========================================================================== */
-
-static uint16_t ADC1_ReadNextConversion(void)
-{
-    while ((ADC1->SR & ADC_SR_EOC) == 0U)
-    {
-    }
-
-    return (uint16_t)ADC1->DR;
-}
-
-static void ADC1_ReadControls(uint16_t *amplitude_raw, uint16_t *frequency_raw)
-{
-    ADC1->CR2 |= ADC_CR2_SWSTART;
-    *amplitude_raw = ADC1_ReadNextConversion();
-    *frequency_raw = ADC1_ReadNextConversion();
-}
-
-/* ========================================================================== */
-/* Function generator                                                         */
-/* ========================================================================== */
-
-static uint16_t AWG_ClampDacCode(float value)
-{
-    if (value < 0.0f)
-    {
-        return 0U;
-    }
-
-    if (value > (float)DAC_MAX_CODE)
-    {
-        return DAC_MAX_CODE;
-    }
-
-    return (uint16_t)value;
-}
-
-static float AWG_AmplitudeToCounts(float amplitude_v)
-{
-    return (2047.5f * amplitude_v) / MAX_AMPLITUDE_V;
-}
-
-static void AWG_GenerateLut(void)
-{
-    bool interrupt_was_enabled = false;
-    float amplitude_counts = AWG_AmplitudeToCounts(s_amplitude_v);
-    float maximum = (float)DAC_CENTER_CODE + amplitude_counts;
-    float minimum = (float)DAC_CENTER_CODE - amplitude_counts;
-    float triangle_value = (float)DAC_CENTER_CODE;
-    float triangle_step = amplitude_counts / ((float)WAVE_LUT_SIZE / 4.0f);
-    float sawtooth_value = minimum;
-    float sawtooth_step = (maximum - minimum) / (float)WAVE_LUT_SIZE;
-
-    if (s_awg_timer_initialized)
-    {
-        interrupt_was_enabled = ((TIM1->DIER & TIM_DIER_UIE) != 0U);
-        TIM1->DIER &= ~TIM_DIER_UIE;
-    }
-
-    for (uint32_t i = 0U; i < WAVE_LUT_SIZE; ++i)
-    {
-        switch (s_waveform)
-        {
-            case WAVEFORM_SINE:
+        case sine:
+            for (int i = 0; i < NS; i++)
             {
-                float angle = (TWO_PI * (float)i) / (float)(WAVE_LUT_SIZE - 1U);
-                s_wave_lut[i] = AWG_ClampDacCode(
-                    (sinf(angle) * amplitude_counts) + (float)DAC_CENTER_CODE);
-                break;
+                float t = (TWO_PI * i) / (NS - 1U);
+                Wave_LUT[i] = (uint16_t)((sinf(t) * Amplitude_calc(desired_Amplitude)) + center);
             }
+            break;
 
-            case WAVEFORM_SQUARE:
-                s_wave_lut[i] = AWG_ClampDacCode(
-                    (i < (WAVE_LUT_SIZE / 2U)) ? maximum : minimum);
-                break;
-
-            case WAVEFORM_TRIANGLE:
-                s_wave_lut[i] = AWG_ClampDacCode(triangle_value);
-
-                if (i < (WAVE_LUT_SIZE / 4U))
+        case square:
+            for (int i = 0; i < NS; i++)
+            {
+                if (i < (NS / 2U))
                 {
-                    triangle_value += triangle_step;
-                }
-                else if (i < ((3U * WAVE_LUT_SIZE) / 4U))
-                {
-                    triangle_value -= triangle_step;
+                    Wave_LUT[i] = (uint16_t)(center + Amplitude_calc(desired_Amplitude));
                 }
                 else
                 {
-                    triangle_value += triangle_step;
+                    Wave_LUT[i] = (uint16_t)(center - Amplitude_calc(desired_Amplitude));
                 }
-                break;
+            }
+            break;
 
-            case WAVEFORM_SAWTOOTH:
-                s_wave_lut[i] = AWG_ClampDacCode(sawtooth_value);
-                sawtooth_value += sawtooth_step;
-                break;
+        case triangle:
+            for (int i = 0; i < NS; i++)
+            {
+                if (i < (NS / 4U))
+                {
+                    Wave_LUT[i] = (uint16_t)cnt;
+                    cnt += step;
+                }
+                else if ((i >= (NS / 4U)) && (i < ((3U * NS) / 4U)))
+                {
+                    Wave_LUT[i] = (uint16_t)cnt;
+                    cnt -= step;
+                }
+                else
+                {
+                    Wave_LUT[i] = (uint16_t)cnt;
+                    cnt += step;
+                }
+            }
+            break;
 
-            default:
-                s_wave_lut[i] = DAC_CENTER_CODE;
-                break;
-        }
+        case sawtooth:
+            for (int i = 0; i < NS; i++)
+            {
+                Wave_LUT[i] = (uint16_t)cnt_sawtooth;
+                cnt_sawtooth += step_sawtooth;
+            }
+            break;
     }
-
-    s_lut_index = 0U;
-
-    if (s_awg_timer_initialized && interrupt_was_enabled)
-    {
-        TIM1->DIER |= TIM_DIER_UIE;
-    }
-}
-
-static void AWG_Init(void)
-{
-    s_waveform = WAVEFORM_SINE;
-    s_amplitude_v = DEFAULT_AMPLITUDE_V;
-    s_frequency_hz = DEFAULT_FREQUENCY_HZ;
-    s_output_enabled = true;
-    s_lut_index = 0U;
-
-    AWG_GenerateLut();
-    AWG_TimerInit(s_frequency_hz);
-}
-
-static void AWG_SetAmplitude(float amplitude_v)
-{
-    if (amplitude_v < 0.0f)
-    {
-        amplitude_v = 0.0f;
-    }
-    else if (amplitude_v > MAX_AMPLITUDE_V)
-    {
-        amplitude_v = MAX_AMPLITUDE_V;
-    }
-
-    if (fabsf(amplitude_v - s_amplitude_v) >= 0.002f)
-    {
-        s_amplitude_v = amplitude_v;
-        AWG_GenerateLut();
-    }
-}
-
-static void AWG_SetFrequency(float frequency_hz)
-{
-    if (frequency_hz < MIN_FREQUENCY_HZ)
-    {
-        frequency_hz = MIN_FREQUENCY_HZ;
-    }
-    else if (frequency_hz > MAX_FREQUENCY_HZ)
-    {
-        frequency_hz = MAX_FREQUENCY_HZ;
-    }
-
-    if (fabsf(frequency_hz - s_frequency_hz) >= 0.1f)
-    {
-        s_frequency_hz = frequency_hz;
-        AWG_TimerSetFrequency(s_frequency_hz);
-    }
-}
-
-static void AWG_SelectNextWaveform(void)
-{
-    s_waveform = (Waveform)(((uint32_t)s_waveform + 1U) % (uint32_t)WAVEFORM_COUNT);
-    AWG_GenerateLut();
-}
-
-static void AWG_ToggleOutput(void)
-{
-    s_output_enabled = !s_output_enabled;
-
-    if (!s_output_enabled)
-    {
-        DAC1->DHR12R1 = DAC_CENTER_CODE;
-    }
-}
-
-/* ========================================================================== */
-/* Oscilloscope                                                               */
-/* ========================================================================== */
-
-static void Scope_Init(void)
-{
-    Scope_TimerInit(SCOPE_SAMPLE_RATE_HZ);
-}
-
-/* ========================================================================== */
-/* User controls                                                              */
-/* ========================================================================== */
-
-static void Controls_Process(void)
-{
-    uint16_t amplitude_raw;
-    uint16_t frequency_raw;
-    float amplitude_v;
-    float frequency_hz;
-    bool output_button;
-    bool wave_button;
-
-    ADC1_ReadControls(&amplitude_raw, &frequency_raw);
-
-    amplitude_v = ((float)amplitude_raw * MAX_AMPLITUDE_V) /
-                  AMPLITUDE_POT_FULL_SCALE;
-
-    frequency_hz = MIN_FREQUENCY_HZ +
-                   (((float)frequency_raw / FREQUENCY_POT_FULL_SCALE) *
-                    (MAX_FREQUENCY_HZ - MIN_FREQUENCY_HZ));
-
-    AWG_SetAmplitude(amplitude_v);
-    AWG_SetFrequency(frequency_hz);
-
-    output_button = ((GPIOB->IDR & (1U << 1)) != 0U);
-    wave_button = ((GPIOB->IDR & (1U << 2)) != 0U);
-
-    if (output_button && !s_previous_output_button)
-    {
-        AWG_ToggleOutput();
-    }
-
-    if (wave_button && !s_previous_wave_button)
-    {
-        AWG_SelectNextWaveform();
-    }
-
-    s_previous_output_button = output_button;
-    s_previous_wave_button = wave_button;
 }
 
 /* ========================================================================== */
@@ -676,60 +497,49 @@ static void Controls_Process(void)
 
 void TIM1_UP_TIM10_IRQHandler(void)
 {
-    if ((TIM1->SR & TIM_SR_UIF) != 0U)
+    if (TIM1->SR & 1U)
     {
-        TIM1->SR &= ~TIM_SR_UIF;
+        DAC->DHR12R1 = Wave_LUT[lut_index++];
+        TIM1->SR &= ~(1U << 0);
 
-        if (s_output_enabled)
+        if (lut_index >= NS)
         {
-            DAC1->DHR12R1 = s_wave_lut[s_lut_index];
-            ++s_lut_index;
-
-            if (s_lut_index >= WAVE_LUT_SIZE)
-            {
-                s_lut_index = 0U;
-            }
+            lut_index = 0U;
         }
     }
 }
 
 void TIM8_UP_TIM13_IRQHandler(void)
 {
-    if ((TIM8->SR & TIM_SR_UIF) != 0U)
+    if (TIM8->SR & 1U)
     {
-        TIM8->SR &= ~TIM_SR_UIF;
-        ADC2->CR2 |= ADC_CR2_SWSTART;
+        ADC2->CR2 |= (1U << 30); /* Start one ADC2 conversion */
+        TIM8->SR &= ~(1U << 0);
     }
 }
 
 void ADC_IRQHandler(void)
 {
-    if ((ADC2->SR & ADC_SR_EOC) != 0U)
+    /* ADC1 and ADC2 share the same interrupt vector */
+    if (ADC1->SR & (1U << 1))
     {
-        g_scope_adc_raw = (uint16_t)ADC2->DR;
-        g_scope_voltage_v =
-            (SCOPE_CALIBRATED_VREF * (float)g_scope_adc_raw) /
-            SCOPE_CALIBRATED_COUNTS;
+        uint16_t ADC1_Val = (uint16_t)ADC1->DR;
+
+        if (flg == 0U)
+        {
+            pot1 = ADC1_Val;
+            flg = 1U;
+        }
+        else
+        {
+            pot2 = ADC1_Val;
+            flg = 0U;
+        }
     }
-}
 
-/* ========================================================================== */
-/* Main                                                                       */
-/* ========================================================================== */
-
-int main(void)
-{
-    FPU_Init();
-    GPIO_Init();
-    DAC_Init();
-    ADC_Init();
-    NVIC_Init();
-
-    AWG_Init();
-    Scope_Init();
-
-    while (1)
+    if (ADC2->SR & (1U << 1))
     {
-        Controls_Process();
+        ADC2_Val_temp = (uint16_t)ADC2->DR;
+        ADC2_Val = (3.0f * ADC2_Val_temp) / 3722.0f;
     }
 }
